@@ -1,0 +1,6 @@
+{
+  "name": "GitCompile",
+  "description": "Compilador em nuvem que envia código-fonte ZIP para o GitHub e monitora a compilação no GitHub Actions em tempo real.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
