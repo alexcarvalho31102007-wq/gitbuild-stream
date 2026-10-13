@@ -22,7 +22,8 @@ import java.util.*
 enum class AppScreen {
     AUTH,
     SELECT_ZIP,
-    COMPILATION_LIVE
+    COMPILATION_STEPS,
+    COMPILATION_LOGS
 }
 
 enum class BuildStatus {
@@ -62,13 +63,18 @@ data class UiState(
     val activeJobs: List<WorkflowJob> = emptyList(),
     val liveLogs: String = "",
     val artifacts: List<ArtifactItem> = emptyList(),
-    val buildErrorMessage: String? = null
+    val buildErrorMessage: String? = null,
+    val isDownloadingApk: Boolean = false,
+    val downloadProgress: Float = 0f,
+    val downloadedApkFile: java.io.File? = null,
+    val downloadErrorMessage: String? = null
 )
 
 class CompilerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val storage = TokenStorage(application)
     private var apiClient: GitHubApiClient = GitHubApiClient { storage.token }
+    private val notificationHelper = com.example.ui.notification.CompilationNotificationHelper(application)
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -280,7 +286,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
 
         compilationPollingJob?.cancel()
         _uiState.value = _uiState.value.copy(
-            currentScreen = AppScreen.COMPILATION_LIVE,
+            currentScreen = AppScreen.COMPILATION_STEPS,
             buildStatus = BuildStatus.UPLOADING,
             uploadProgress = 0.05f,
             uploadStageText = "Conectando ao repositório $repoFullName...",
@@ -364,6 +370,10 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                         uploadProgress = currentProgress,
                         uploadStageText = "Enviado (${index + 1}/$totalFiles): ${file.path.takeLast(30)}"
                     )
+                    if (index % 10 == 0 || index == totalFiles - 1) {
+                        val pct = ((index + 1) * 100 / totalFiles)
+                        notificationHelper.updateProgress(scan.fileName, 2, "Enviando código ao GitHub ($pct%)", 5)
+                    }
                 }
 
                 // Step 3: Create Git Tree
@@ -478,6 +488,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
     }
 
     private suspend fun pollWorkflowRun(owner: String, repo: String, branch: String, commitSha: String) {
+        val fileName = _uiState.value.zipScan?.fileName ?: "Projeto.zip"
         var foundRun: WorkflowRun? = null
         var attempts = 0
         val maxFindAttempts = 30 // up to ~75s
@@ -496,8 +507,10 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                 if (matchingRun != null) {
                     foundRun = matchingRun
                     appendLog("GitHub Actions detectado: Execução #${matchingRun.runNumber} (${matchingRun.name})")
+                    notificationHelper.updateProgress(fileName, 3, "Runner alocado para a execução #${matchingRun.runNumber}", 5)
                 } else {
                     appendLog("Aguardando GitHub Actions enfileirar o build (tentativa $attempts)...")
+                    notificationHelper.updateProgress(fileName, 3, "Aguardando Runner do GitHub Actions...", 5)
                     if (attempts >= 6 && attempts - lastDispatchAttempt >= 6) {
                         lastDispatchAttempt = attempts
                         try {
@@ -526,6 +539,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                 buildStatus = BuildStatus.FAILURE,
                 buildErrorMessage = "Timeout: GitHub Actions não iniciou. Verifique se as Actions estão habilitadas no repositório."
             )
+            notificationHelper.notifyFailure(fileName, "Timeout no GitHub Actions")
             return
         }
 
@@ -572,6 +586,14 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                     buildStatus = statusEnum
                 )
 
+                if (statusEnum == BuildStatus.IN_PROGRESS) {
+                    val currentStep = primaryJob?.steps?.firstOrNull { it.status == "in_progress" }?.name
+                        ?: "Compilando com Gradle no Ubuntu Runner..."
+                    notificationHelper.updateProgress(fileName, 4, currentStep, 5)
+                } else if (statusEnum == BuildStatus.QUEUED) {
+                    notificationHelper.updateProgress(fileName, 3, "Aguardando executor virtual...", 5)
+                }
+
                 if (isCompleted) {
                     try {
                         val artifactsResp = apiClient.api.getWorkflowArtifacts(owner, repo, runId)
@@ -583,8 +605,12 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
 
                     if (statusEnum == BuildStatus.SUCCESS) {
                         appendLog("\n🎉 COMPILAÇÃO FINALIZADA COM SUCESSO NO GITHUB ACTIONS!")
+                        notificationHelper.notifySuccess(fileName, "APK")
                     } else if (statusEnum == BuildStatus.FAILURE) {
                         appendLog("\n❌ COMPILAÇÃO FALHOU NO GITHUB ACTIONS. Verifique os erros acima.")
+                        notificationHelper.notifyFailure(fileName, "Falha na compilação do Gradle")
+                    } else {
+                        notificationHelper.cancelNotification()
                     }
                     break
                 }
@@ -601,12 +627,50 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = _uiState.value.copy(liveLogs = if (current.isEmpty()) line else "$current\n$line")
     }
 
+    fun downloadArtifact(artifact: ArtifactItem) {
+        val fileName = _uiState.value.zipScan?.fileName ?: "Projeto.zip"
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isDownloadingApk = true,
+                downloadProgress = 0f,
+                downloadErrorMessage = null
+            )
+            val file = com.example.data.zip.ArtifactDownloader.downloadAndExtractApk(
+                getApplication(),
+                apiClient,
+                artifact
+            ) { progress ->
+                _uiState.value = _uiState.value.copy(downloadProgress = progress)
+            }
+
+            if (file != null && file.exists() && file.length() > 0L) {
+                _uiState.value = _uiState.value.copy(
+                    isDownloadingApk = false,
+                    downloadedApkFile = file,
+                    downloadErrorMessage = null
+                )
+                notificationHelper.notifySuccess(fileName, file.name)
+            } else {
+                _uiState.value = _uiState.value.copy(
+                    isDownloadingApk = false,
+                    downloadErrorMessage = "Falha ao baixar o APK. Verifique sua conexão com o GitHub."
+                )
+            }
+        }
+    }
+
+    fun installDownloadedApk(context: android.content.Context) {
+        val file = _uiState.value.downloadedApkFile ?: return
+        com.example.data.zip.ArtifactDownloader.installOrOpenApk(context, file)
+    }
+
     fun cancelCompilation() {
         val state = _uiState.value
         val run = state.activeRun ?: return
         val parts = state.selectedRepoFullName.split("/")
         if (parts.size != 2) return
 
+        notificationHelper.cancelNotification()
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 apiClient.api.cancelWorkflowRun(parts[0], parts[1], run.id)
@@ -619,6 +683,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
 
     fun resetCompilation() {
         compilationPollingJob?.cancel()
+        notificationHelper.cancelNotification()
         _uiState.value = _uiState.value.copy(
             currentScreen = AppScreen.SELECT_ZIP,
             buildStatus = BuildStatus.IDLE,
@@ -626,7 +691,11 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
             activeJobs = emptyList(),
             liveLogs = "",
             artifacts = emptyList(),
-            buildErrorMessage = null
+            buildErrorMessage = null,
+            isDownloadingApk = false,
+            downloadProgress = 0f,
+            downloadedApkFile = null,
+            downloadErrorMessage = null
         )
     }
 }

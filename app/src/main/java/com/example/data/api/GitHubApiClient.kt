@@ -159,7 +159,7 @@ class GitHubApiClient(private val tokenProvider: () -> String) {
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("User-Agent", "GitCompile-Android-App")
 
-            if (token.isNotEmpty()) {
+            if (token.isNotEmpty() && original.url.host.contains("github.com")) {
                 requestBuilder.header("Authorization", "Bearer $token")
             }
             chain.proceed(requestBuilder.build())
@@ -187,6 +187,50 @@ class GitHubApiClient(private val tokenProvider: () -> String) {
             }
         } catch (e: Exception) {
             "Carregando logs do GitHub Actions..."
+        }
+    }
+
+    /**
+     * Download artifact zip directly following 302 redirects
+     */
+    suspend fun downloadArtifactZip(
+        downloadUrl: String,
+        outputFile: java.io.File,
+        onProgress: (Float) -> Unit = {}
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val request = okhttp3.Request.Builder()
+                .url(downloadUrl)
+                .build()
+
+            val response = okHttpClient.newCall(request).execute()
+            if (!response.isSuccessful) {
+                return@withContext false
+            }
+
+            val body = response.body ?: return@withContext false
+            val contentLength = body.contentLength()
+
+            body.byteStream().use { input ->
+                outputFile.outputStream().use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var bytesRead: Int
+                    var totalRead = 0L
+
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        if (contentLength > 0) {
+                            onProgress((totalRead.toFloat() / contentLength).coerceIn(0f, 1f))
+                        }
+                    }
+                    output.flush()
+                }
+            }
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
         }
     }
 }
