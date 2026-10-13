@@ -123,6 +123,20 @@ interface GitHubApiService {
         @Path("repo") repo: String,
         @Path("run_id") runId: Long
     ): ArtifactsResponse
+
+    @GET("repos/{owner}/{repo}/actions/workflows")
+    suspend fun getWorkflows(
+        @Path("owner") owner: String,
+        @Path("repo") repo: String
+    ): WorkflowsResponse
+
+    @POST("repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches")
+    suspend fun dispatchWorkflow(
+        @Path("owner") owner: String,
+        @Path("repo") repo: String,
+        @Path("workflow_id") workflowId: String,
+        @Body request: WorkflowDispatchRequest
+    ): Response<Unit>
 }
 
 class GitHubApiClient(private val tokenProvider: () -> String) {

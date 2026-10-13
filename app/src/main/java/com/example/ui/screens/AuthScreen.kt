@@ -523,7 +523,8 @@ fun UserConnectedCard(
             OutlinedTextField(
                 value = targetBranch,
                 onValueChange = onBranchChanged,
-                label = { Text("Branch de Execução (Padrão: cloud-compile)") },
+                label = { Text("Branch de Compilação (Recomendado: main)") },
+                supportingText = { Text("Use a branch principal para o GitHub Actions registrar os workflows automaticamente.", fontSize = 11.sp) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("target_branch_input"),

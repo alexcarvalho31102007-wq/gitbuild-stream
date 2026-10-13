@@ -178,7 +178,6 @@ object ZipProcessor {
 name: "Cloud Compiler CI"
 on:
   push:
-    branches: ['**']
   workflow_dispatch:
 
 jobs:

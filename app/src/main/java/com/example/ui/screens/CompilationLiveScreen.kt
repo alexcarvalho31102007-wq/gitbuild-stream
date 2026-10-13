@@ -118,12 +118,14 @@ fun CompilationLiveScreen(
                     ) {
                         Icon(Icons.Default.ContentCopy, contentDescription = "Copiar Logs")
                     }
-                    if (uiState.activeRun?.htmlUrl?.isNotBlank() == true) {
+                    if (uiState.selectedRepoFullName.isNotBlank()) {
+                        val actionsUrl = uiState.activeRun?.htmlUrl?.ifBlank { null }
+                            ?: "https://github.com/${uiState.selectedRepoFullName}/actions"
                         IconButton(onClick = {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uiState.activeRun.htmlUrl))
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(actionsUrl))
                             context.startActivity(intent)
                         }) {
-                            Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Abrir no GitHub")
+                            Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = "Abrir no GitHub Actions")
                         }
                     }
                 },

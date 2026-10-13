@@ -16,7 +16,7 @@ class TokenStorage(context: Context) {
         set(value) = prefs.edit().putString(KEY_SELECTED_REPO, value.trim()).apply()
 
     var targetBranch: String
-        get() = prefs.getString(KEY_TARGET_BRANCH, "cloud-compile") ?: "cloud-compile"
+        get() = prefs.getString(KEY_TARGET_BRANCH, "main") ?: "main"
         set(value) = prefs.edit().putString(KEY_TARGET_BRANCH, value.trim()).apply()
 
     var lastUsername: String

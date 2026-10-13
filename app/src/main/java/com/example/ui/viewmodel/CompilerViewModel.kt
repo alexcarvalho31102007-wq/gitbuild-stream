@@ -14,6 +14,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONObject
+import retrofit2.HttpException
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -44,7 +46,7 @@ data class UiState(
     val userRepos: List<GitHubRepo> = emptyList(),
     val isLoadingRepos: Boolean = false,
     val selectedRepoFullName: String = "",
-    val targetBranch: String = "cloud-compile",
+    val targetBranch: String = "main",
     val isCreatingRepo: Boolean = false,
     
     // Zip
@@ -72,7 +74,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         UiState(
             token = storage.token,
             selectedRepoFullName = storage.selectedRepo,
-            targetBranch = storage.targetBranch
+            targetBranch = storage.targetBranch.ifBlank { "main" }
         )
     )
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
@@ -83,6 +85,30 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         if (storage.token.isNotBlank()) {
             validateAndLoadUser(storage.token)
         }
+    }
+
+    private fun extractErrorMessage(e: Throwable): String {
+        if (e is HttpException) {
+            val code = e.code()
+            val rawBody = try {
+                e.response()?.errorBody()?.string()
+            } catch (_: Exception) {
+                null
+            }
+            if (!rawBody.isNullOrBlank()) {
+                try {
+                    val json = JSONObject(rawBody)
+                    val msg = json.optString("message", "")
+                    if (msg.isNotBlank()) {
+                        return "HTTP $code: $msg"
+                    }
+                } catch (_: Exception) {
+                    return "HTTP $code: $rawBody"
+                }
+            }
+            return "HTTP $code: ${e.message()}"
+        }
+        return e.localizedMessage ?: e.javaClass.simpleName
     }
 
     fun onTokenChanged(newToken: String) {
@@ -115,7 +141,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     isCheckingAuth = false,
-                    authError = "Falha ao autenticar com o GitHub: ${e.localizedMessage ?: "Verifique seu token e permissões (repo, workflow)."}"
+                    authError = "Falha ao autenticar com o GitHub: ${extractErrorMessage(e)}"
                 )
             }
         }
@@ -127,13 +153,25 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
             try {
                 val repos = apiClient.api.getUserRepos(perPage = 100)
                 var currentSelected = _uiState.value.selectedRepoFullName
+                var currentBranch = _uiState.value.targetBranch
+
                 if (currentSelected.isBlank() && repos.isNotEmpty()) {
                     currentSelected = repos.first().fullName
+                    currentBranch = repos.first().defaultBranch.ifBlank { "main" }
                     storage.selectedRepo = currentSelected
+                    storage.targetBranch = currentBranch
+                } else if (repos.isNotEmpty()) {
+                    val found = repos.firstOrNull { it.fullName.equals(currentSelected, ignoreCase = true) }
+                    if (found != null && currentBranch.isBlank()) {
+                        currentBranch = found.defaultBranch.ifBlank { "main" }
+                        storage.targetBranch = currentBranch
+                    }
                 }
+
                 _uiState.value = _uiState.value.copy(
                     userRepos = repos,
                     selectedRepoFullName = currentSelected,
+                    targetBranch = currentBranch.ifBlank { "main" },
                     isLoadingRepos = false
                 )
             } catch (e: Exception) {
@@ -143,12 +181,17 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun onSelectRepo(repoFullName: String) {
-        storage.selectedRepo = repoFullName
-        _uiState.value = _uiState.value.copy(selectedRepoFullName = repoFullName)
+        val cleanName = repoFullName.trim()
+        val matchingRepo = _uiState.value.userRepos.firstOrNull { it.fullName.equals(cleanName, ignoreCase = true) }
+        val branch = matchingRepo?.defaultBranch?.ifBlank { "main" } ?: _uiState.value.targetBranch.ifBlank { "main" }
+
+        storage.selectedRepo = cleanName
+        storage.targetBranch = branch
+        _uiState.value = _uiState.value.copy(selectedRepoFullName = cleanName, targetBranch = branch)
     }
 
     fun onBranchChanged(branch: String) {
-        val cleanBranch = branch.trim().ifBlank { "cloud-compile" }
+        val cleanBranch = branch.trim().ifBlank { "main" }
         storage.targetBranch = cleanBranch
         _uiState.value = _uiState.value.copy(targetBranch = cleanBranch)
     }
@@ -166,15 +209,17 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                     )
                 )
                 storage.selectedRepo = newRepo.fullName
+                storage.targetBranch = newRepo.defaultBranch.ifBlank { "main" }
                 loadUserRepos()
                 _uiState.value = _uiState.value.copy(
                     selectedRepoFullName = newRepo.fullName,
+                    targetBranch = newRepo.defaultBranch.ifBlank { "main" },
                     isCreatingRepo = false
                 )
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     isCreatingRepo = false,
-                    authError = "Não foi possível criar o repositório: ${e.localizedMessage}"
+                    authError = "Não foi possível criar o repositório: ${extractErrorMessage(e)}"
                 )
             }
         }
@@ -229,16 +274,16 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
             _uiState.value = _uiState.value.copy(zipError = "Formato de repositório inválido. Use 'usuario/repositorio'.")
             return
         }
-        val owner = parts[0]
-        val repo = parts[1]
-        val branch = state.targetBranch.ifBlank { "cloud-compile" }
+        val owner = parts[0].trim()
+        val repo = parts[1].trim()
+        val branch = state.targetBranch.trim().ifBlank { "main" }
 
         compilationPollingJob?.cancel()
         _uiState.value = _uiState.value.copy(
             currentScreen = AppScreen.COMPILATION_LIVE,
             buildStatus = BuildStatus.UPLOADING,
             uploadProgress = 0.05f,
-            uploadStageText = "Preparando conexão com repositório $repoFullName...",
+            uploadStageText = "Conectando ao repositório $repoFullName...",
             activeRun = null,
             activeJobs = emptyList(),
             liveLogs = "Iniciando processo de compilação em nuvem...\n",
@@ -249,33 +294,37 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         compilationPollingJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 appendLog("Conectando ao GitHub ($repoFullName)...")
-                appendLog("Ramo de compilação: $branch")
+                val repoDetails = apiClient.api.getRepo(owner, repo)
+                val defaultBranch = repoDetails.defaultBranch.ifBlank { "main" }
+                val effectiveBranch = if (branch.isBlank()) defaultBranch else branch
 
-                // Step 1: Check or create target branch
+                appendLog("Ramo de compilação: $effectiveBranch (Padrão: $defaultBranch)")
+
+                // Step 1: Check existing branch commit to use as parent
                 var parentCommitSha: String? = null
+                var branchExists = false
+
                 try {
-                    val branchRefResp = apiClient.api.getBranchRef(owner, repo, branch)
+                    val branchRefResp = apiClient.api.getBranchRef(owner, repo, effectiveBranch)
                     if (branchRefResp.isSuccessful && branchRefResp.body()?.obj != null) {
+                        branchExists = true
                         parentCommitSha = branchRefResp.body()?.obj?.sha
-                        appendLog("Ramo '$branch' localizado (Commit: ${parentCommitSha?.take(7)}).")
-                    } else {
-                        // Check default branch to branch off
-                        val repoDetails = apiClient.api.getRepo(owner, repo)
-                        val defaultBranch = repoDetails.defaultBranch
-                        val defaultRef = apiClient.api.getBranchRef(owner, repo, defaultBranch)
-                        val defaultSha = defaultRef.body()?.obj?.sha
-                        if (defaultSha != null) {
-                            apiClient.api.createRef(
-                                owner,
-                                repo,
-                                GitCreateRefRequest(ref = "refs/heads/$branch", sha = defaultSha)
-                            )
-                            parentCommitSha = defaultSha
-                            appendLog("Novo ramo '$branch' criado a partir de '$defaultBranch'.")
-                        }
+                        appendLog("Ramo '$effectiveBranch' localizado (Commit: ${parentCommitSha?.take(7)}).")
                     }
-                } catch (e: Exception) {
-                    appendLog("Aviso: Configurando árvore Git diretamente...")
+                } catch (_: Exception) {
+                    branchExists = false
+                }
+
+                if (!branchExists && effectiveBranch != defaultBranch) {
+                    try {
+                        val defRefResp = apiClient.api.getBranchRef(owner, repo, defaultBranch)
+                        if (defRefResp.isSuccessful && defRefResp.body()?.obj != null) {
+                            parentCommitSha = defRefResp.body()?.obj?.sha
+                            appendLog("Usando base de '$defaultBranch' (Commit: ${parentCommitSha?.take(7)}).")
+                        }
+                    } catch (_: Exception) {
+                        // Repository might be empty
+                    }
                 }
 
                 // Step 2: Prepare Git Tree Items
@@ -288,7 +337,6 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
 
                 val treeItems = mutableListOf<GitTreeItem>()
                 for ((index, file) in scan.files.withIndex()) {
-                    // For small text files under 60KB, include content directly
                     if (file.isText && file.bytes.size < 60 * 1024) {
                         val contentString = String(file.bytes, Charsets.UTF_8)
                         treeItems.add(
@@ -300,7 +348,6 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                             )
                         )
                     } else {
-                        // Create Blob via GitHub API
                         val b64 = Base64.encodeToString(file.bytes, Base64.NO_WRAP)
                         val blobResp = apiClient.api.createBlob(owner, repo, GitBlobRequest(content = b64))
                         treeItems.add(
@@ -350,26 +397,52 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                 )
                 appendLog("Commit criado com sucesso (SHA: ${commitResponse.sha.take(7)}).")
 
-                // Step 5: Update Branch Ref
-                appendLog("Atualizando ramo '$branch'...")
-                try {
-                    apiClient.api.updateBranchRef(
-                        owner,
-                        repo,
-                        branch,
-                        GitUpdateRefRequest(sha = commitResponse.sha, force = true)
-                    )
-                } catch (e: Exception) {
-                    apiClient.api.createRef(
-                        owner,
-                        repo,
-                        GitCreateRefRequest(ref = "refs/heads/$branch", sha = commitResponse.sha)
-                    )
+                // Step 5: Update or Create Branch Ref safely
+                appendLog("Atualizando referência do ramo '$effectiveBranch'...")
+                var refUpdated = false
+
+                if (branchExists) {
+                    try {
+                        apiClient.api.updateBranchRef(
+                            owner,
+                            repo,
+                            effectiveBranch,
+                            GitUpdateRefRequest(sha = commitResponse.sha, force = true)
+                        )
+                        refUpdated = true
+                        appendLog("Ramo '$effectiveBranch' atualizado com sucesso.")
+                    } catch (e: Exception) {
+                        appendLog("Aviso ao atualizar ramo: ${extractErrorMessage(e)}. Tentando alternativa...")
+                    }
+                }
+
+                if (!refUpdated) {
+                    try {
+                        apiClient.api.createRef(
+                            owner,
+                            repo,
+                            GitCreateRefRequest(ref = "refs/heads/$effectiveBranch", sha = commitResponse.sha)
+                        )
+                        appendLog("Ramo '$effectiveBranch' criado com sucesso.")
+                    } catch (e: Exception) {
+                        // If 409 (Reference already exists), force update
+                        try {
+                            apiClient.api.updateBranchRef(
+                                owner,
+                                repo,
+                                effectiveBranch,
+                                GitUpdateRefRequest(sha = commitResponse.sha, force = true)
+                            )
+                            appendLog("Ramo '$effectiveBranch' forçado para o commit ${commitResponse.sha.take(7)}.")
+                        } catch (e2: Exception) {
+                            throw Exception("Falha ao definir o ramo '$effectiveBranch': ${extractErrorMessage(e2)}")
+                        }
+                    }
                 }
 
                 _uiState.value = _uiState.value.copy(
                     uploadProgress = 1.0f,
-                    uploadStageText = "Código enviado! Aguardando o GitHub Actions iniciar os servidores de compilação...",
+                    uploadStageText = "Código enviado! Disparando runners do GitHub Actions...",
                     buildStatus = BuildStatus.QUEUED
                 )
                 appendLog("\n========================================================")
@@ -377,11 +450,24 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                 appendLog("Aguardando GitHub Actions provisionar os runners...")
                 appendLog("========================================================\n")
 
+                // Try to dispatch workflow directly if already registered
+                try {
+                    apiClient.api.dispatchWorkflow(
+                        owner,
+                        repo,
+                        "compile.yml",
+                        WorkflowDispatchRequest(ref = effectiveBranch)
+                    )
+                    appendLog("Disparo manual workflow_dispatch enviado ao GitHub Actions.")
+                } catch (_: Exception) {
+                    // Push trigger is primary
+                }
+
                 // Step 6: Poll GitHub Actions Workflow Runs
-                pollWorkflowRun(owner, repo, branch, commitResponse.sha)
+                pollWorkflowRun(owner, repo, effectiveBranch, commitResponse.sha)
 
             } catch (e: Exception) {
-                val errorMsg = "Erro durante o envio: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                val errorMsg = "Erro durante o envio: ${extractErrorMessage(e)}"
                 appendLog("\n❌ $errorMsg")
                 _uiState.value = _uiState.value.copy(
                     buildStatus = BuildStatus.FAILURE,
@@ -394,28 +480,52 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
     private suspend fun pollWorkflowRun(owner: String, repo: String, branch: String, commitSha: String) {
         var foundRun: WorkflowRun? = null
         var attempts = 0
-        val maxFindAttempts = 24 // up to ~60s to detect run start
+        val maxFindAttempts = 30 // up to ~75s
+        var lastDispatchAttempt = 0
 
         while (foundRun == null && attempts < maxFindAttempts && currentCoroutineContext().isActive) {
             attempts++
             delay(2500)
             try {
-                val runsResp = apiClient.api.getWorkflowRuns(owner, repo, branch, perPage = 5)
+                // Query all runs in the repo to avoid query-param mismatch
+                val runsResp = apiClient.api.getWorkflowRuns(owner, repo, branch = null, perPage = 10)
                 val matchingRun = runsResp.workflowRuns.firstOrNull { it.headSha == commitSha }
-                    ?: runsResp.workflowRuns.firstOrNull() // fallback to latest run on branch
+                    ?: runsResp.workflowRuns.firstOrNull { it.headBranch == branch }
+                    ?: runsResp.workflowRuns.firstOrNull()
+
                 if (matchingRun != null) {
                     foundRun = matchingRun
                     appendLog("GitHub Actions detectado: Execução #${matchingRun.runNumber} (${matchingRun.name})")
                 } else {
                     appendLog("Aguardando GitHub Actions enfileirar o build (tentativa $attempts)...")
+                    if (attempts >= 6 && attempts - lastDispatchAttempt >= 6) {
+                        lastDispatchAttempt = attempts
+                        try {
+                            apiClient.api.dispatchWorkflow(
+                                owner,
+                                repo,
+                                "compile.yml",
+                                WorkflowDispatchRequest(ref = branch)
+                            )
+                            appendLog("Reenviando sinal de inicialização para o GitHub Actions...")
+                        } catch (_: Exception) { }
+                    }
                 }
             } catch (e: Exception) {
-                // Keep trying
+                appendLog("Verificando status: ${extractErrorMessage(e)}")
             }
         }
 
         if (foundRun == null) {
-            appendLog("Aviso: O GitHub Actions pode demorar alguns instantes adicionais para enfileirar.")
+            appendLog("\n⚠️ O GitHub Actions não iniciou automaticamente em 75 segundos.")
+            appendLog("Verificações recomendadas:")
+            appendLog("1. No GitHub, vá em https://github.com/$owner/$repo/actions e verifique se as Actions estão habilitadas (botão 'I understand my workflows, go ahead and enable them').")
+            appendLog("2. Verifique se o seu Token tem o escopo 'workflow' marcado.")
+            appendLog("3. Se o repositório foi recém-criado, o GitHub pode levar até 1 minuto para aprovar a primeira execução de workflow.")
+            _uiState.value = _uiState.value.copy(
+                buildStatus = BuildStatus.FAILURE,
+                buildErrorMessage = "Timeout: GitHub Actions não iniciou. Verifique se as Actions estão habilitadas no repositório."
+            )
             return
         }
 
@@ -463,16 +573,13 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                 )
 
                 if (isCompleted) {
-                    // Fetch artifacts if any were produced
                     try {
                         val artifactsResp = apiClient.api.getWorkflowArtifacts(owner, repo, runId)
                         _uiState.value = _uiState.value.copy(artifacts = artifactsResp.artifacts)
                         if (artifactsResp.artifacts.isNotEmpty()) {
                             appendLog("\n📦 Artefatos compilados disponíveis para download: ${artifactsResp.artifacts.size} arquivo(s)")
                         }
-                    } catch (e: Exception) {
-                        // ignore
-                    }
+                    } catch (_: Exception) { }
 
                     if (statusEnum == BuildStatus.SUCCESS) {
                         appendLog("\n🎉 COMPILAÇÃO FINALIZADA COM SUCESSO NO GITHUB ACTIONS!")
@@ -505,7 +612,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                 apiClient.api.cancelWorkflowRun(parts[0], parts[1], run.id)
                 appendLog("Cancelamento solicitado para a execução #${run.runNumber}...")
             } catch (e: Exception) {
-                appendLog("Não foi possível cancelar: ${e.localizedMessage}")
+                appendLog("Não foi possível cancelar: ${extractErrorMessage(e)}")
             }
         }
     }

@@ -171,3 +171,24 @@ data class ArtifactItem(
     @Json(name = "archive_download_url") val archiveDownloadUrl: String = "",
     @Json(name = "expired") val expired: Boolean = false
 )
+
+@JsonClass(generateAdapter = true)
+data class WorkflowDispatchRequest(
+    @Json(name = "ref") val ref: String,
+    @Json(name = "inputs") val inputs: Map<String, String> = emptyMap()
+)
+
+@JsonClass(generateAdapter = true)
+data class WorkflowsResponse(
+    @Json(name = "total_count") val totalCount: Int = 0,
+    @Json(name = "workflows") val workflows: List<WorkflowItem> = emptyList()
+)
+
+@JsonClass(generateAdapter = true)
+data class WorkflowItem(
+    @Json(name = "id") val id: Long = 0L,
+    @Json(name = "name") val name: String = "",
+    @Json(name = "path") val path: String = "",
+    @Json(name = "state") val state: String = ""
+)
+
