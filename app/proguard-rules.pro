@@ -19,12 +19,3 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
-
-# Shizuku API and reflection preservation
--keep class rikka.shizuku.** { *; }
--keep interface rikka.shizuku.** { *; }
-
-# AndroidX Room
--keep class androidx.room.** { *; }
--dontwarn androidx.room.**
--keep class * extends androidx.room.RoomDatabase

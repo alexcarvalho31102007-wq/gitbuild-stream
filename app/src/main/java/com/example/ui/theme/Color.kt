@@ -2,26 +2,24 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-// Premium Primary & State Colors
-val PrimaryLight = Color(0xFF2563EB)      // Tailwind Blue 600
-val PrimaryDark = Color(0xFF3B82F6)       // Tailwind Blue 500 (better contrast in dark mode)
-val SuccessColor = Color(0xFF10B981)      // Tailwind Emerald 500
-val ErrorColor = Color(0xFFEF4444)        // Tailwind Red 500
+val GitHubDarkBg = Color(0xFF0D1117)
+val GitHubCardBg = Color(0xFF161B22)
+val GitHubCardElevated = Color(0xFF21262D)
+val GitHubBorder = Color(0xFF30363D)
+val GitHubTextPrimary = Color(0xFFF0F6FC)
+val GitHubTextSecondary = Color(0xFF8B949E)
+val GitHubBlue = Color(0xFF2F81F7)
+val GitHubBlueAccent = Color(0xFF58A6FF)
+val GitHubGreen = Color(0xFF238636)
+val GitHubGreenAccent = Color(0xFF3FB950)
+val GitHubRed = Color(0xFFDA3633)
+val GitHubRedAccent = Color(0xFFF85149)
+val GitHubYellow = Color(0xFFD29922)
+val GitHubPurple = Color(0xFF8957E5)
 
-// Dark Theme (Pure Neutral Black & Deep Neutral Gray - No Dark Blue)
-val DarkBackground = Color(0xFF000000)       // Pure Black (AMOLED Black)
-val DarkSurface = Color(0xFF121212)          // True Neutral Dark Surface (Zero Blue)
-val DarkSurfaceVariant = Color(0xFF1E1E1E)    // True Neutral Dark Gray (Zero Blue)
-val DarkOutline = Color(0xFF2E2E2E)          // Neutral Border
-val DarkOutlineVariant = Color(0xFF242424)   // Subtle Neutral Border
-val DarkTextPrimary = Color(0xFFF5F5F5)      // Crisp White
-val DarkTextSecondary = Color(0xFFA3A3A3)    // Neutral Mid Gray (Zero Blue)
-
-// Light Theme (Pure White & Clean Neutral - No Blue Tint)
-val LightBackground = Color(0xFFFFFFFF)      // Pure Clean White
-val LightSurface = Color(0xFFFFFFFF)         // Pure White Surface
-val LightSurfaceVariant = Color(0xFFF4F4F5)  // Neutral Light Gray (Zero Blue)
-val LightOutline = Color(0xFFE4E4E7)         // Neutral Light Border
-val LightOutlineVariant = Color(0xFFF0F0F2)  // Subtle Light Border
-val LightTextPrimary = Color(0xFF18181B)     // Deep Neutral Charcoal (Zero Blue)
-val LightTextSecondary = Color(0xFF71717A)    // Neutral Medium Gray (Zero Blue)
+// Light theme alternatives
+val GitHubLightBg = Color(0xFFF6F8FA)
+val GitHubLightCard = Color(0xFFFFFFFF)
+val GitHubLightBorder = Color(0xFFD0D7DE)
+val GitHubLightTextPrimary = Color(0xFF1F2328)
+val GitHubLightTextSecondary = Color(0xFF656D76)
