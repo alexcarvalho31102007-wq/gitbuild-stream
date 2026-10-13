@@ -2,7 +2,6 @@ package com.example.data.zip
 
 import android.content.Context
 import android.net.Uri
-import android.util.Base64
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.util.zip.ZipEntry
@@ -28,7 +27,8 @@ data class ZipScanResult(
     val totalSize: Long,
     val files: List<ExtractedFile>,
     val detectedTechnologies: List<String>,
-    val hasCustomWorkflow: Boolean
+    val hadOriginalWorkflows: Boolean,
+    val workflowStandardized: Boolean = true
 )
 
 object ZipProcessor {
@@ -78,33 +78,35 @@ object ZipProcessor {
         // If all files share a common single root folder (e.g., project-master/src/...), strip it
         val cleanedFiles = stripCommonRootDirectory(rawFiles)
 
-        // Check if user already provided .github/workflows
-        val hasCustomWorkflow = cleanedFiles.any {
-            it.path.startsWith(".github/workflows/") && (it.path.endsWith(".yml") || it.path.endsWith(".yaml"))
+        // Check if original ZIP had any workflows
+        val hadOriginalWorkflows = cleanedFiles.any {
+            it.path.startsWith(".github/workflows/")
         }
 
-        val finalFiles = cleanedFiles.toMutableList()
+        // Filter out any third-party/old workflows so GitCompile standardization is ALWAYS 100% enforced
+        val sanitizedFiles = cleanedFiles.filterNot {
+            it.path.startsWith(".github/workflows/")
+        }.toMutableList()
 
-        // If no workflow is present, add our universal auto-detect CI workflow
-        if (!hasCustomWorkflow) {
-            val workflowContent = generateUniversalWorkflow()
-            finalFiles.add(
-                ExtractedFile(
-                    path = ".github/workflows/compile.yml",
-                    bytes = workflowContent.toByteArray(Charsets.UTF_8),
-                    isText = true
-                )
+        // ALWAYS inject GitCompile's official verified CI workflow
+        val workflowContent = generateUniversalWorkflow()
+        sanitizedFiles.add(
+            ExtractedFile(
+                path = ".github/workflows/compile.yml",
+                bytes = workflowContent.toByteArray(Charsets.UTF_8),
+                isText = true
             )
-        }
+        )
 
-        val detectedTechnologies = detectTechnologies(finalFiles)
+        val detectedTechnologies = detectTechnologies(sanitizedFiles)
 
         return ZipScanResult(
             fileName = originalFileName,
             totalSize = totalBytesRead,
-            files = finalFiles,
+            files = sanitizedFiles,
             detectedTechnologies = detectedTechnologies,
-            hasCustomWorkflow = hasCustomWorkflow
+            hadOriginalWorkflows = hadOriginalWorkflows,
+            workflowStandardized = true
         )
     }
 
@@ -143,7 +145,7 @@ object ZipProcessor {
         val paths = files.map { it.path }
 
         if (paths.any { it.endsWith("build.gradle") || it.endsWith("build.gradle.kts") }) {
-            techs.add("Gradle (Java / Kotlin)")
+            techs.add("Android / Gradle (Kotlin / Java)")
         }
         if (paths.any { it.endsWith("pom.xml") }) {
             techs.add("Apache Maven")
@@ -194,29 +196,29 @@ jobs:
         id: detect
         run: |
           echo "=============================================="
-          echo ">>> Arquivos recebidos no repositório:"
+          echo ">>> Inspecionando arquivos do projeto:"
           ls -la
           echo "=============================================="
           
           if [ -f "gradlew" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || [ -f "pom.xml" ]; then
             echo "has_jvm=true" >> ${'$'}GITHUB_OUTPUT
-            echo "JVM detectado."
+            echo "Ambiente Java / Gradle detectado."
           fi
           if [ -f "package.json" ]; then
             echo "has_node=true" >> ${'$'}GITHUB_OUTPUT
-            echo "Node.js detectado."
+            echo "Ambiente Node.js detectado."
           fi
           if [ -f "Cargo.toml" ]; then
             echo "has_rust=true" >> ${'$'}GITHUB_OUTPUT
-            echo "Rust detectado."
+            echo "Ambiente Rust detectado."
           fi
           if [ -f "go.mod" ]; then
             echo "has_go=true" >> ${'$'}GITHUB_OUTPUT
-            echo "Go detectado."
+            echo "Ambiente Go detectado."
           fi
           if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
             echo "has_python=true" >> ${'$'}GITHUB_OUTPUT
-            echo "Python detectado."
+            echo "Ambiente Python detectado."
           fi
 
       - name: "3. Configurar JDK 17"
@@ -238,28 +240,45 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: "6. Executar Compilação"
+      - name: "6. Executar Compilação Padronizada"
         run: |
           set -e
           echo "=============================================="
-          echo ">>> INICIANDO COMPILAÇÃO NO GITHUB ACTIONS"
+          echo ">>> INICIANDO COMPILAÇÃO OFICIAL GITCOMPILE"
           echo "=============================================="
           
           if [ -f "./compile.sh" ]; then
-            echo ">>> Executando script de compilação customizado compile.sh..."
+            echo ">>> Executando script customizado compile.sh..."
             chmod +x ./compile.sh
             ./compile.sh
           elif [ -f "./build.sh" ]; then
-            echo ">>> Executando script de compilação customizado build.sh..."
+            echo ">>> Executando script customizado build.sh..."
             chmod +x ./build.sh
             ./build.sh
           elif [ -f "gradlew" ]; then
-            echo ">>> Executando Gradle Wrapper..."
+            echo ">>> Iniciando compilação no modo RELEASE..."
             chmod +x ./gradlew
-            ./gradlew build --no-daemon --stacktrace || ./gradlew assembleDebug --no-daemon
+            
+            # Criar keystore temporária para assinar caso o projeto não tenha keystore própria
+            keytool -genkeypair -v -keystore /tmp/gitcompile-release.jks -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Release, OU=GitCompile, O=App, C=BR" 2>/dev/null || true
+            
+            if ./gradlew assembleRelease --no-daemon --stacktrace; then
+              echo ">>> Compilação assembleRelease concluída com sucesso!"
+            else
+              echo ">>> assembleRelease padrão falhou (keystore privada ausente). Tentando compilar Release com injeção segura de assinatura..."
+              ./gradlew assembleRelease -Pandroid.injected.signing.store.file=/tmp/gitcompile-release.jks -Pandroid.injected.signing.store.password=android -Pandroid.injected.signing.key.alias=release -Pandroid.injected.signing.key.password=android --no-daemon || ./gradlew assembleDebug --no-daemon
+            fi
+            
+            # Se gerou APK release unsigned (sem assinatura), assina automaticamente para o usuário poder instalar no celular
+            find . -name "*release-unsigned.apk" | while read unsigned_apk; do
+              signed_apk="${'$'}{unsigned_apk%-unsigned.apk}.apk"
+              echo ">>> Assinando APK Release automaticamente: ${'$'}unsigned_apk -> ${'$'}signed_apk"
+              jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 -keystore /tmp/gitcompile-release.jks -storepass android -keypass android "${'$'}unsigned_apk" release 2>/dev/null && mv "${'$'}unsigned_apk" "${'$'}signed_apk" || true
+            done
           elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            echo ">>> Executando Gradle..."
-            gradle build --no-daemon || gradle assembleDebug --no-daemon
+            echo ">>> Iniciando compilação Gradle no modo RELEASE..."
+            keytool -genkeypair -v -keystore /tmp/gitcompile-release.jks -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Release, OU=GitCompile, O=App, C=BR" 2>/dev/null || true
+            gradle assembleRelease --no-daemon --stacktrace || gradle assembleDebug --no-daemon
           elif [ -f "pom.xml" ]; then
             echo ">>> Executando Apache Maven..."
             mvn clean package -B
@@ -275,7 +294,7 @@ jobs:
             if grep -q "\"build\":" package.json; then
               npm run build
             else
-              echo "Script de build não configurado em package.json. npm install concluído com sucesso."
+              echo "Script de build não configurado em package.json. Dependências instaladas com sucesso."
             fi
           elif [ -f "Makefile" ]; then
             echo ">>> Compilando com Make..."
@@ -302,17 +321,18 @@ jobs:
           fi
           
           echo "=============================================="
-          echo ">>> COMPILAÇÃO CONCLUÍDA COM SUCESSO!"
+          echo ">>> COMPILAÇÃO FINALIZADA COM SUCESSO!"
           echo "=============================================="
 
-      - name: "7. Salvar Artefatos Compilados"
+      - name: "7. Salvar Artefatos Compilados (APKs e Binários)"
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: compiled-artifacts
           path: |
-            **/build/libs/*.jar
             **/build/outputs/apk/**/*.apk
+            **/build/outputs/bundle/**/*.aab
+            **/build/libs/*.jar
             **/target/*.jar
             **/target/release/*
             **/dist/**

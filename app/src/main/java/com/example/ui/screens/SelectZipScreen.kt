@@ -431,28 +431,30 @@ fun ZipDetailsCard(
             Spacer(modifier = Modifier.height(10.dp))
 
             Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
-                    modifier = Modifier.padding(10.dp),
+                    modifier = Modifier.padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(
-                        imageVector = if (scan.hasCustomWorkflow) Icons.Default.Code else Icons.Default.AutoFixHigh,
+                        imageVector = Icons.Default.Verified,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.secondary,
-                        modifier = Modifier.size(20.dp)
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
-                        text = if (scan.hasCustomWorkflow)
-                            "Usando workflow customizado (.github/workflows) do ZIP."
+                        text = if (scan.hadOriginalWorkflows)
+                            "Padrão GitCompile Ativo: Compilação em modo RELEASE. Workflows antigos foram substituídos pelo workflow oficial que gera e assina o APK mesmo sem keystore própria."
                         else
-                            "Workflow universal multi-compilador injetado automaticamente.",
+                            "Padrão GitCompile Ativo: Compilação configurada em modo RELEASE. Caso não haja keystore privada, o build assina o APK automaticamente para instalação sem erros.",
                         fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurface,
+                        lineHeight = 17.sp
                     )
                 }
             }
