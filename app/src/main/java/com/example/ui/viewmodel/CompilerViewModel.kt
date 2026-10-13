@@ -1,6 +1,8 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
@@ -8,8 +10,10 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.api.GitHubApiClient
 import com.example.data.model.*
 import com.example.data.storage.TokenStorage
+import com.example.data.zip.ArtifactDownloader
 import com.example.data.zip.ZipProcessor
 import com.example.data.zip.ZipScanResult
+import com.example.ui.notification.CompilationNotificationHelper
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,25 +40,33 @@ enum class BuildStatus {
     CANCELLED
 }
 
+enum class StepStatus {
+    PENDING,
+    IN_PROGRESS,
+    SUCCESS,
+    FAILURE
+}
+
 data class UiState(
     val currentScreen: AppScreen = AppScreen.AUTH,
     val token: String = "",
     val currentUser: GitHubUser? = null,
     val isCheckingAuth: Boolean = false,
     val authError: String? = null,
-    
+
     // Repos
     val userRepos: List<GitHubRepo> = emptyList(),
     val isLoadingRepos: Boolean = false,
     val selectedRepoFullName: String = "",
     val targetBranch: String = "main",
     val isCreatingRepo: Boolean = false,
-    
-    // Zip
+
+    // Zip & File
+    val selectedFileName: String = "",
     val zipScan: ZipScanResult? = null,
     val isProcessingZip: Boolean = false,
     val zipError: String? = null,
-    
+
     // Upload & Compilation
     val buildStatus: BuildStatus = BuildStatus.IDLE,
     val uploadProgress: Float = 0f,
@@ -67,14 +79,24 @@ data class UiState(
     val isDownloadingApk: Boolean = false,
     val downloadProgress: Float = 0f,
     val downloadedApkFile: java.io.File? = null,
-    val downloadErrorMessage: String? = null
+    val downloadErrorMessage: String? = null,
+
+    // 4 Real Stages Tracking
+    val step1Status: StepStatus = StepStatus.PENDING,
+    val step1Detail: String = "Validação dos arquivos e injeção do workflow",
+    val step2Status: StepStatus = StepStatus.PENDING,
+    val step2Detail: String = "Criação de commit e envio para o GitHub",
+    val step3Status: StepStatus = StepStatus.PENDING,
+    val step3Detail: String = "Execução do Gradle no GitHub Actions",
+    val step4Status: StepStatus = StepStatus.PENDING,
+    val step4Detail: String = "Geração e disponibilização do APK"
 )
 
 class CompilerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val storage = TokenStorage(application)
     private var apiClient: GitHubApiClient = GitHubApiClient { storage.token }
-    private val notificationHelper = com.example.ui.notification.CompilationNotificationHelper(application)
+    private val notificationHelper = CompilationNotificationHelper(application)
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -86,6 +108,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
     private var compilationPollingJob: Job? = null
+    private var isCurrentlyCompiling: Boolean = false
 
     init {
         if (storage.token.isNotBlank()) {
@@ -147,7 +170,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     isCheckingAuth = false,
-                    authError = "Falha ao autenticar com o GitHub: ${extractErrorMessage(e)}"
+                    authError = "Falha ao validar token: ${extractErrorMessage(e)}"
                 )
             }
         }
@@ -202,7 +225,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = _uiState.value.copy(targetBranch = cleanBranch)
     }
 
-    fun createDedicatedBuildRepo(repoName: String = "git-compile-runner") {
+    fun createDedicatedBuildRepo(repoName: String = "git-compile-runner", onComplete: () -> Unit = {}) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isCreatingRepo = true)
             try {
@@ -222,6 +245,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                     targetBranch = newRepo.defaultBranch.ifBlank { "main" },
                     isCreatingRepo = false
                 )
+                onComplete()
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     isCreatingRepo = false,
@@ -233,6 +257,7 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
 
     fun logout() {
         compilationPollingJob?.cancel()
+        isCurrentlyCompiling = false
         storage.clear()
         apiClient = GitHubApiClient { "" }
         _uiState.value = UiState(currentScreen = AppScreen.AUTH)
@@ -242,106 +267,179 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = _uiState.value.copy(currentScreen = screen)
     }
 
-    fun onZipSelected(uri: Uri, fileName: String) {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isProcessingZip = true, zipError = null)
-            try {
-                val scanResult = withContext(Dispatchers.IO) {
-                    ZipProcessor.processZipUri(getApplication(), uri, fileName)
-                }
-                _uiState.value = _uiState.value.copy(
-                    zipScan = scanResult,
-                    isProcessingZip = false,
-                    zipError = null
-                )
-            } catch (e: Exception) {
-                _uiState.value = _uiState.value.copy(
-                    isProcessingZip = false,
-                    zipError = "Erro ao processar arquivo ZIP: ${e.localizedMessage ?: "Arquivo inválido ou corrompido"}"
-                )
-            }
-        }
-    }
-
-    fun clearSelectedZip() {
-        _uiState.value = _uiState.value.copy(zipScan = null, zipError = null)
-    }
-
-    fun startCompilation() {
-        val state = _uiState.value
-        val scan = state.zipScan ?: return
-        val repoFullName = state.selectedRepoFullName.ifBlank {
-            _uiState.value = _uiState.value.copy(zipError = "Selecione ou informe um repositório do GitHub.")
+    /**
+     * Called immediately when user picks a ZIP file.
+     * Automatically extracts, sanitizes, and triggers GitHub Actions compilation.
+     * Enforces single compilation per request.
+     */
+    fun onZipSelectedAndStartCompilation(uri: Uri, fileName: String) {
+        if (isCurrentlyCompiling) {
             return
         }
 
+        val cleanFileName = if (fileName.isNotBlank()) fileName else "codigo-fonte.zip"
+
+        viewModelScope.launch {
+            // Transition directly to the compilation screen
+            _uiState.value = _uiState.value.copy(
+                selectedFileName = cleanFileName,
+                currentScreen = AppScreen.COMPILATION_STEPS,
+                isProcessingZip = true,
+                zipError = null,
+                buildStatus = BuildStatus.UPLOADING,
+                step1Status = StepStatus.IN_PROGRESS,
+                step1Detail = "Extraindo e validando arquivos do projeto...",
+                step2Status = StepStatus.PENDING,
+                step2Detail = "Aguardando preparação...",
+                step3Status = StepStatus.PENDING,
+                step3Detail = "Aguardando envio...",
+                step4Status = StepStatus.PENDING,
+                step4Detail = "Aguardando compilação...",
+                activeRun = null,
+                activeJobs = emptyList(),
+                liveLogs = "",
+                artifacts = emptyList(),
+                downloadedApkFile = null,
+                downloadErrorMessage = null,
+                buildErrorMessage = null
+            )
+
+            notificationHelper.updateProgress(cleanFileName, 1, "Preparação do projeto")
+
+            // Process Zip
+            val scanResult = try {
+                withContext(Dispatchers.IO) {
+                    ZipProcessor.processZipUri(getApplication(), uri, cleanFileName)
+                }
+            } catch (e: Exception) {
+                val err = "Erro ao processar arquivo ZIP: ${e.localizedMessage ?: "Arquivo inválido"}"
+                _uiState.value = _uiState.value.copy(
+                    isProcessingZip = false,
+                    buildStatus = BuildStatus.FAILURE,
+                    step1Status = StepStatus.FAILURE,
+                    step1Detail = err,
+                    buildErrorMessage = err
+                )
+                notificationHelper.notifyFailure(cleanFileName, "Falha ao preparar o projeto")
+                return@launch
+            }
+
+            _uiState.value = _uiState.value.copy(
+                zipScan = scanResult,
+                isProcessingZip = false,
+                step1Status = StepStatus.SUCCESS,
+                step1Detail = "Projeto preparado (${scanResult.files.size} arquivos)."
+            )
+
+            // Make sure repository is selected or create one automatically
+            var repoFullName = _uiState.value.selectedRepoFullName
+            if (repoFullName.isBlank()) {
+                if (_uiState.value.userRepos.isNotEmpty()) {
+                    repoFullName = _uiState.value.userRepos.first().fullName
+                    storage.selectedRepo = repoFullName
+                    _uiState.value = _uiState.value.copy(selectedRepoFullName = repoFullName)
+                } else {
+                    // Create dedicated repository automatically
+                    try {
+                        val newRepo = withContext(Dispatchers.IO) {
+                            apiClient.api.createRepo(
+                                CreateRepoRequest(
+                                    name = "git-compile-runner",
+                                    description = "Repositório criado pelo GitCompile para compilação",
+                                    private = true,
+                                    autoInit = true
+                                )
+                            )
+                        }
+                        repoFullName = newRepo.fullName
+                        storage.selectedRepo = repoFullName
+                        storage.targetBranch = newRepo.defaultBranch.ifBlank { "main" }
+                        _uiState.value = _uiState.value.copy(
+                            selectedRepoFullName = repoFullName,
+                            targetBranch = newRepo.defaultBranch.ifBlank { "main" }
+                        )
+                    } catch (e: Exception) {
+                        val err = "Falha ao configurar repositório no GitHub: ${extractErrorMessage(e)}"
+                        _uiState.value = _uiState.value.copy(
+                            buildStatus = BuildStatus.FAILURE,
+                            step2Status = StepStatus.FAILURE,
+                            step2Detail = err,
+                            buildErrorMessage = err
+                        )
+                        notificationHelper.notifyFailure(cleanFileName, "Erro no repositório")
+                        return@launch
+                    }
+                }
+            }
+
+            // Execute real compilation
+            executeCompilation(scanResult, repoFullName, _uiState.value.targetBranch)
+        }
+    }
+
+    private fun executeCompilation(scan: ZipScanResult, repoFullName: String, branch: String) {
         val parts = repoFullName.split("/")
         if (parts.size != 2) {
-            _uiState.value = _uiState.value.copy(zipError = "Formato de repositório inválido. Use 'usuario/repositorio'.")
+            val err = "Nome de repositório inválido: $repoFullName"
+            _uiState.value = _uiState.value.copy(
+                buildStatus = BuildStatus.FAILURE,
+                step2Status = StepStatus.FAILURE,
+                step2Detail = err,
+                buildErrorMessage = err
+            )
             return
         }
+
         val owner = parts[0].trim()
         val repo = parts[1].trim()
-        val branch = state.targetBranch.trim().ifBlank { "main" }
+        val effectiveBranch = branch.trim().ifBlank { "main" }
+        val fileName = scan.fileName
 
         compilationPollingJob?.cancel()
+        isCurrentlyCompiling = true
+
         _uiState.value = _uiState.value.copy(
-            currentScreen = AppScreen.COMPILATION_STEPS,
             buildStatus = BuildStatus.UPLOADING,
-            uploadProgress = 0.05f,
-            uploadStageText = "Conectando ao repositório $repoFullName...",
-            activeRun = null,
-            activeJobs = emptyList(),
-            liveLogs = "Iniciando processo de compilação em nuvem...\n",
-            artifacts = emptyList(),
-            buildErrorMessage = null
+            step2Status = StepStatus.IN_PROGRESS,
+            step2Detail = "Conectando ao GitHub ($repoFullName)...",
+            uploadProgress = 0.05f
         )
+        notificationHelper.updateProgress(fileName, 2, "Envio do código-fonte")
 
         compilationPollingJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                appendLog("Conectando ao GitHub ($repoFullName)...")
+                appendLog("Conectando ao repositório GitHub ($repoFullName)...")
                 val repoDetails = apiClient.api.getRepo(owner, repo)
                 val defaultBranch = repoDetails.defaultBranch.ifBlank { "main" }
-                val effectiveBranch = if (branch.isBlank()) defaultBranch else branch
+                val targetBranch = if (effectiveBranch.isBlank()) defaultBranch else effectiveBranch
 
-                appendLog("Ramo de compilação: $effectiveBranch (Padrão: $defaultBranch)")
-
-                // Step 1: Check existing branch commit to use as parent
+                // Step 2.1: Check parent commit
                 var parentCommitSha: String? = null
                 var branchExists = false
-
                 try {
-                    val branchRefResp = apiClient.api.getBranchRef(owner, repo, effectiveBranch)
+                    val branchRefResp = apiClient.api.getBranchRef(owner, repo, targetBranch)
                     if (branchRefResp.isSuccessful && branchRefResp.body()?.obj != null) {
                         branchExists = true
                         parentCommitSha = branchRefResp.body()?.obj?.sha
-                        appendLog("Ramo '$effectiveBranch' localizado (Commit: ${parentCommitSha?.take(7)}).")
                     }
                 } catch (_: Exception) {
                     branchExists = false
                 }
 
-                if (!branchExists && effectiveBranch != defaultBranch) {
+                if (!branchExists && targetBranch != defaultBranch) {
                     try {
                         val defRefResp = apiClient.api.getBranchRef(owner, repo, defaultBranch)
                         if (defRefResp.isSuccessful && defRefResp.body()?.obj != null) {
                             parentCommitSha = defRefResp.body()?.obj?.sha
-                            appendLog("Usando base de '$defaultBranch' (Commit: ${parentCommitSha?.take(7)}).")
                         }
-                    } catch (_: Exception) {
-                        // Repository might be empty
-                    }
+                    } catch (_: Exception) { }
                 }
 
-                // Step 2: Prepare Git Tree Items
+                // Step 2.2: Upload blobs
                 val totalFiles = scan.files.size
-                appendLog("Enviando $totalFiles arquivos do código-fonte para o GitHub...")
-                _uiState.value = _uiState.value.copy(
-                    uploadStageText = "Enviando $totalFiles arquivos para o GitHub...",
-                    uploadProgress = 0.15f
-                )
-
+                appendLog("Enviando $totalFiles arquivos para o GitHub...")
                 val treeItems = mutableListOf<GitTreeItem>()
+
                 for ((index, file) in scan.files.withIndex()) {
                     if (file.isText && file.bytes.size < 60 * 1024) {
                         val contentString = String(file.bytes, Charsets.UTF_8)
@@ -365,37 +463,30 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                             )
                         )
                     }
-                    val currentProgress = 0.15f + (0.50f * (index + 1) / totalFiles)
+
+                    val pct = ((index + 1) * 100 / totalFiles)
+                    val progressFloat = 0.05f + (0.75f * (index + 1) / totalFiles)
                     _uiState.value = _uiState.value.copy(
-                        uploadProgress = currentProgress,
-                        uploadStageText = "Enviado (${index + 1}/$totalFiles): ${file.path.takeLast(30)}"
+                        uploadProgress = progressFloat,
+                        step2Detail = "Enviando arquivos ($pct%): ${index + 1} de $totalFiles"
                     )
-                    if (index % 10 == 0 || index == totalFiles - 1) {
-                        val pct = ((index + 1) * 100 / totalFiles)
-                        notificationHelper.updateProgress(scan.fileName, 2, "Enviando código ao GitHub ($pct%)", 5)
+
+                    if (index % 15 == 0 || index == totalFiles - 1) {
+                        notificationHelper.updateProgress(fileName, 2, "Envio do código-fonte ($pct%)")
                     }
                 }
 
-                // Step 3: Create Git Tree
-                appendLog("Gerando Git Tree no GitHub...")
-                _uiState.value = _uiState.value.copy(
-                    uploadStageText = "Criando árvore Git com os arquivos...",
-                    uploadProgress = 0.75f
-                )
+                // Step 2.3: Create Git Tree
+                appendLog("Criando árvore de arquivos Git...")
                 val treeResponse = apiClient.api.createTree(
                     owner,
                     repo,
                     GitTreeRequest(tree = treeItems)
                 )
-                appendLog("Árvore Git criada (SHA: ${treeResponse.sha.take(7)}).")
 
-                // Step 4: Create Commit
-                appendLog("Criando commit de compilação...")
-                _uiState.value = _uiState.value.copy(
-                    uploadStageText = "Registrando commit de compilação...",
-                    uploadProgress = 0.85f
-                )
-                val commitMsg = "Compilação de código via GitCompile: ${scan.fileName} [${SimpleDateFormat("HH:mm:ss dd/MM", Locale.getDefault()).format(Date())}]"
+                // Step 2.4: Create Commit
+                appendLog("Registrando commit de compilação...")
+                val commitMsg = "Compilação de ${scan.fileName} via GitCompile [${SimpleDateFormat("HH:mm:ss dd/MM/yyyy", Locale.getDefault()).format(Date())}]"
                 val commitResponse = apiClient.api.createCommit(
                     owner,
                     repo,
@@ -405,25 +496,20 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                         parents = if (parentCommitSha != null) listOf(parentCommitSha) else emptyList()
                     )
                 )
-                appendLog("Commit criado com sucesso (SHA: ${commitResponse.sha.take(7)}).")
 
-                // Step 5: Update or Create Branch Ref safely
-                appendLog("Atualizando referência do ramo '$effectiveBranch'...")
+                // Step 2.5: Update branch
+                appendLog("Atualizando ramo '$targetBranch'...")
                 var refUpdated = false
-
                 if (branchExists) {
                     try {
                         apiClient.api.updateBranchRef(
                             owner,
                             repo,
-                            effectiveBranch,
+                            targetBranch,
                             GitUpdateRefRequest(sha = commitResponse.sha, force = true)
                         )
                         refUpdated = true
-                        appendLog("Ramo '$effectiveBranch' atualizado com sucesso.")
-                    } catch (e: Exception) {
-                        appendLog("Aviso ao atualizar ramo: ${extractErrorMessage(e)}. Tentando alternativa...")
-                    }
+                    } catch (_: Exception) { }
                 }
 
                 if (!refUpdated) {
@@ -431,96 +517,84 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                         apiClient.api.createRef(
                             owner,
                             repo,
-                            GitCreateRefRequest(ref = "refs/heads/$effectiveBranch", sha = commitResponse.sha)
+                            GitCreateRefRequest(ref = "refs/heads/$targetBranch", sha = commitResponse.sha)
                         )
-                        appendLog("Ramo '$effectiveBranch' criado com sucesso.")
-                    } catch (e: Exception) {
-                        // If 409 (Reference already exists), force update
-                        try {
-                            apiClient.api.updateBranchRef(
-                                owner,
-                                repo,
-                                effectiveBranch,
-                                GitUpdateRefRequest(sha = commitResponse.sha, force = true)
-                            )
-                            appendLog("Ramo '$effectiveBranch' forçado para o commit ${commitResponse.sha.take(7)}.")
-                        } catch (e2: Exception) {
-                            throw Exception("Falha ao definir o ramo '$effectiveBranch': ${extractErrorMessage(e2)}")
-                        }
+                    } catch (_: Exception) {
+                        apiClient.api.updateBranchRef(
+                            owner,
+                            repo,
+                            targetBranch,
+                            GitUpdateRefRequest(sha = commitResponse.sha, force = true)
+                        )
                     }
                 }
 
+                // Step 2 Completed
                 _uiState.value = _uiState.value.copy(
+                    step2Status = StepStatus.SUCCESS,
+                    step2Detail = "Código enviado com sucesso para o GitHub.",
                     uploadProgress = 1.0f,
-                    uploadStageText = "Código enviado! Disparando runners do GitHub Actions...",
-                    buildStatus = BuildStatus.QUEUED
+                    buildStatus = BuildStatus.QUEUED,
+                    step3Status = StepStatus.IN_PROGRESS,
+                    step3Detail = "Aguardando executor virtual do GitHub Actions..."
                 )
-                appendLog("\n========================================================")
-                appendLog("✓ Código-fonte enviado com sucesso para o GitHub!")
-                appendLog("Aguardando GitHub Actions provisionar os runners...")
-                appendLog("========================================================\n")
+                notificationHelper.updateProgress(fileName, 3, "Compilação do APK no GitHub Actions")
 
-                // Try to dispatch workflow directly if already registered
+                // Trigger workflow_dispatch if configured
                 try {
                     apiClient.api.dispatchWorkflow(
                         owner,
                         repo,
                         "compile.yml",
-                        WorkflowDispatchRequest(ref = effectiveBranch)
+                        WorkflowDispatchRequest(ref = targetBranch)
                     )
-                    appendLog("Disparo manual workflow_dispatch enviado ao GitHub Actions.")
-                } catch (_: Exception) {
-                    // Push trigger is primary
-                }
+                } catch (_: Exception) { }
 
-                // Step 6: Poll GitHub Actions Workflow Runs
-                pollWorkflowRun(owner, repo, effectiveBranch, commitResponse.sha)
+                // Step 3: Monitor GitHub Actions
+                pollWorkflow(owner, repo, targetBranch, commitResponse.sha, fileName)
 
             } catch (e: Exception) {
-                val errorMsg = "Erro durante o envio: ${extractErrorMessage(e)}"
-                appendLog("\n❌ $errorMsg")
+                isCurrentlyCompiling = false
+                val err = "Erro no envio do código: ${extractErrorMessage(e)}"
+                appendLog("❌ $err")
                 _uiState.value = _uiState.value.copy(
                     buildStatus = BuildStatus.FAILURE,
-                    buildErrorMessage = errorMsg
+                    step2Status = StepStatus.FAILURE,
+                    step2Detail = err,
+                    buildErrorMessage = err
                 )
+                notificationHelper.notifyFailure(fileName, "Falha no envio do código")
             }
         }
     }
 
-    private suspend fun pollWorkflowRun(owner: String, repo: String, branch: String, commitSha: String) {
-        val fileName = _uiState.value.zipScan?.fileName ?: "Projeto.zip"
+    private suspend fun pollWorkflow(owner: String, repo: String, branch: String, commitSha: String, fileName: String) {
         var foundRun: WorkflowRun? = null
         var attempts = 0
-        val maxFindAttempts = 30 // up to ~75s
-        var lastDispatchAttempt = 0
+        val maxWaitAttempts = 30 // ~75 seconds
+        var lastDispatch = 0
 
-        while (foundRun == null && attempts < maxFindAttempts && currentCoroutineContext().isActive) {
+        while (foundRun == null && attempts < maxWaitAttempts && currentCoroutineContext().isActive) {
             attempts++
             delay(2500)
             try {
-                // Query all runs in the repo to avoid query-param mismatch
                 val runsResp = apiClient.api.getWorkflowRuns(owner, repo, branch = null, perPage = 10)
-                val matchingRun = runsResp.workflowRuns.firstOrNull { it.headSha == commitSha }
+                val matching = runsResp.workflowRuns.firstOrNull { it.headSha == commitSha }
                     ?: runsResp.workflowRuns.firstOrNull { it.headBranch == branch }
                     ?: runsResp.workflowRuns.firstOrNull()
 
-                if (matchingRun != null) {
-                    foundRun = matchingRun
-                    appendLog("GitHub Actions detectado: Execução #${matchingRun.runNumber} (${matchingRun.name})")
-                    notificationHelper.updateProgress(fileName, 3, "Runner alocado para a execução #${matchingRun.runNumber}", 5)
+                if (matching != null) {
+                    foundRun = matching
+                    _uiState.value = _uiState.value.copy(
+                        activeRun = matching,
+                        step3Detail = "GitHub Actions #${matching.runNumber}: em andamento"
+                    )
+                    notificationHelper.updateProgress(fileName, 3, "Compilação do APK no GitHub Actions")
                 } else {
-                    appendLog("Aguardando GitHub Actions enfileirar o build (tentativa $attempts)...")
-                    notificationHelper.updateProgress(fileName, 3, "Aguardando Runner do GitHub Actions...", 5)
-                    if (attempts >= 6 && attempts - lastDispatchAttempt >= 6) {
-                        lastDispatchAttempt = attempts
+                    if (attempts >= 5 && attempts - lastDispatch >= 5) {
+                        lastDispatch = attempts
                         try {
-                            apiClient.api.dispatchWorkflow(
-                                owner,
-                                repo,
-                                "compile.yml",
-                                WorkflowDispatchRequest(ref = branch)
-                            )
-                            appendLog("Reenviando sinal de inicialização para o GitHub Actions...")
+                            apiClient.api.dispatchWorkflow(owner, repo, "compile.yml", WorkflowDispatchRequest(ref = branch))
                         } catch (_: Exception) { }
                     }
                 }
@@ -530,14 +604,14 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         }
 
         if (foundRun == null) {
-            appendLog("\n⚠️ O GitHub Actions não iniciou automaticamente em 75 segundos.")
-            appendLog("Verificações recomendadas:")
-            appendLog("1. No GitHub, vá em https://github.com/$owner/$repo/actions e verifique se as Actions estão habilitadas (botão 'I understand my workflows, go ahead and enable them').")
-            appendLog("2. Verifique se o seu Token tem o escopo 'workflow' marcado.")
-            appendLog("3. Se o repositório foi recém-criado, o GitHub pode levar até 1 minuto para aprovar a primeira execução de workflow.")
+            isCurrentlyCompiling = false
+            val err = "O GitHub Actions não iniciou dentro do prazo esperado. Verifique se as Actions estão ativadas no repositório."
+            appendLog("❌ $err")
             _uiState.value = _uiState.value.copy(
                 buildStatus = BuildStatus.FAILURE,
-                buildErrorMessage = "Timeout: GitHub Actions não iniciou. Verifique se as Actions estão habilitadas no repositório."
+                step3Status = StepStatus.FAILURE,
+                step3Detail = "Tempo limite excedido no GitHub Actions.",
+                buildErrorMessage = err
             )
             notificationHelper.notifyFailure(fileName, "Timeout no GitHub Actions")
             return
@@ -545,20 +619,15 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
 
         val runId = foundRun.id
         var isCompleted = false
-        var lastLogJobId: Long? = null
 
         while (!isCompleted && currentCoroutineContext().isActive) {
             try {
                 val currentRun = apiClient.api.getWorkflowRun(owner, repo, runId)
                 val jobsResp = apiClient.api.getWorkflowRunJobs(owner, repo, runId)
                 val jobs = jobsResp.jobs
-
                 val primaryJob = jobs.firstOrNull()
-                if (primaryJob != null && primaryJob.id != lastLogJobId) {
-                    lastLogJobId = primaryJob.id
-                }
 
-                // Fetch latest live logs
+                // Fetch latest job logs
                 if (primaryJob != null) {
                     val logs = apiClient.fetchJobLogsText(owner, repo, primaryJob.id)
                     if (logs.isNotBlank() && logs.length > 20) {
@@ -566,58 +635,89 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
 
-                val statusEnum = when (currentRun.status) {
+                val currentStepName = primaryJob?.steps?.firstOrNull { it.status == "in_progress" }?.name
+                    ?: "Compilando código com Gradle no Ubuntu Runner..."
+
+                when (currentRun.status) {
                     "completed" -> {
                         isCompleted = true
-                        when (currentRun.conclusion) {
-                            "success" -> BuildStatus.SUCCESS
-                            "failure" -> BuildStatus.FAILURE
-                            "cancelled" -> BuildStatus.CANCELLED
-                            else -> BuildStatus.FAILURE
+                        isCurrentlyCompiling = false
+
+                        if (currentRun.conclusion == "success") {
+                            // Step 3 Success, Proceed to Step 4
+                            _uiState.value = _uiState.value.copy(
+                                activeRun = currentRun,
+                                activeJobs = jobs,
+                                step3Status = StepStatus.SUCCESS,
+                                step3Detail = "APK compilado com sucesso!",
+                                step4Status = StepStatus.IN_PROGRESS,
+                                step4Detail = "Localizando arquivos e gerando link do APK..."
+                            )
+                            notificationHelper.updateProgress(fileName, 4, "Finalização do APK")
+
+                            // Poll artifacts for up to 12 seconds
+                            var artifactsList: List<ArtifactItem> = emptyList()
+                            for (artAttempt in 1..6) {
+                                try {
+                                    val artResp = apiClient.api.getWorkflowArtifacts(owner, repo, runId)
+                                    if (artResp.artifacts.isNotEmpty()) {
+                                        artifactsList = artResp.artifacts
+                                        break
+                                    }
+                                } catch (_: Exception) { }
+                                delay(2000)
+                            }
+
+                            _uiState.value = _uiState.value.copy(
+                                buildStatus = BuildStatus.SUCCESS,
+                                step4Status = StepStatus.SUCCESS,
+                                step4Detail = if (artifactsList.isNotEmpty()) "APK disponível para download!" else "Compilação concluída no GitHub Actions.",
+                                artifacts = artifactsList
+                            )
+                            notificationHelper.notifySuccess(fileName, "APK")
+                            appendLog("\n🎉 COMPILAÇÃO FINALIZADA COM SUCESSO!")
+                        } else {
+                            // Failure
+                            val failReason = currentRun.conclusion ?: "falha"
+                            _uiState.value = _uiState.value.copy(
+                                buildStatus = BuildStatus.FAILURE,
+                                activeRun = currentRun,
+                                activeJobs = jobs,
+                                step3Status = StepStatus.FAILURE,
+                                step3Detail = "Compilação falhou no Gradle ($failReason).",
+                                step4Status = StepStatus.PENDING,
+                                step4Detail = "Cancelado devido a falha na compilação.",
+                                buildErrorMessage = "A compilação do APK falhou no GitHub Actions. Verifique os logs de erro para mais detalhes."
+                            )
+                            notificationHelper.notifyFailure(fileName, "Falha na compilação")
+                            appendLog("\n❌ COMPILAÇÃO FALHOU NO GITHUB ACTIONS.")
                         }
                     }
-                    "in_progress" -> BuildStatus.IN_PROGRESS
-                    else -> BuildStatus.QUEUED
-                }
-
-                _uiState.value = _uiState.value.copy(
-                    activeRun = currentRun,
-                    activeJobs = jobs,
-                    buildStatus = statusEnum
-                )
-
-                if (statusEnum == BuildStatus.IN_PROGRESS) {
-                    val currentStep = primaryJob?.steps?.firstOrNull { it.status == "in_progress" }?.name
-                        ?: "Compilando com Gradle no Ubuntu Runner..."
-                    notificationHelper.updateProgress(fileName, 4, currentStep, 5)
-                } else if (statusEnum == BuildStatus.QUEUED) {
-                    notificationHelper.updateProgress(fileName, 3, "Aguardando executor virtual...", 5)
-                }
-
-                if (isCompleted) {
-                    try {
-                        val artifactsResp = apiClient.api.getWorkflowArtifacts(owner, repo, runId)
-                        _uiState.value = _uiState.value.copy(artifacts = artifactsResp.artifacts)
-                        if (artifactsResp.artifacts.isNotEmpty()) {
-                            appendLog("\n📦 Artefatos compilados disponíveis para download: ${artifactsResp.artifacts.size} arquivo(s)")
-                        }
-                    } catch (_: Exception) { }
-
-                    if (statusEnum == BuildStatus.SUCCESS) {
-                        appendLog("\n🎉 COMPILAÇÃO FINALIZADA COM SUCESSO NO GITHUB ACTIONS!")
-                        notificationHelper.notifySuccess(fileName, "APK")
-                    } else if (statusEnum == BuildStatus.FAILURE) {
-                        appendLog("\n❌ COMPILAÇÃO FALHOU NO GITHUB ACTIONS. Verifique os erros acima.")
-                        notificationHelper.notifyFailure(fileName, "Falha na compilação do Gradle")
-                    } else {
-                        notificationHelper.cancelNotification()
+                    "in_progress" -> {
+                        _uiState.value = _uiState.value.copy(
+                            buildStatus = BuildStatus.IN_PROGRESS,
+                            activeRun = currentRun,
+                            activeJobs = jobs,
+                            step3Status = StepStatus.IN_PROGRESS,
+                            step3Detail = currentStepName
+                        )
+                        notificationHelper.updateProgress(fileName, 3, "Compilação do APK: $currentStepName")
                     }
-                    break
+                    else -> {
+                        _uiState.value = _uiState.value.copy(
+                            buildStatus = BuildStatus.QUEUED,
+                            activeRun = currentRun,
+                            activeJobs = jobs,
+                            step3Status = StepStatus.IN_PROGRESS,
+                            step3Detail = "Na fila de execução do GitHub Actions..."
+                        )
+                        notificationHelper.updateProgress(fileName, 3, "Aguardando fila do GitHub Actions")
+                    }
                 }
 
-            } catch (e: Exception) {
-                // Continue polling
-            }
+                if (isCompleted) break
+
+            } catch (_: Exception) { }
             delay(2800)
         }
     }
@@ -627,41 +727,88 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = _uiState.value.copy(liveLogs = if (current.isEmpty()) line else "$current\n$line")
     }
 
-    fun downloadArtifact(artifact: ArtifactItem) {
-        val fileName = _uiState.value.zipScan?.fileName ?: "Projeto.zip"
+    /**
+     * Downloads the compiled APK directly from the artifact.
+     * If artifacts list is empty, attempts re-fetching or opens browser fallback.
+     */
+    fun downloadLatestApk(context: Context) {
+        val state = _uiState.value
+        val fileName = state.selectedFileName.ifBlank { "app.apk" }
+
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 isDownloadingApk = true,
                 downloadProgress = 0f,
                 downloadErrorMessage = null
             )
-            val file = com.example.data.zip.ArtifactDownloader.downloadAndExtractApk(
-                getApplication(),
-                apiClient,
-                artifact
-            ) { progress ->
-                _uiState.value = _uiState.value.copy(downloadProgress = progress)
+
+            var artifactToDownload = state.artifacts.firstOrNull { it.name.contains("apk", ignoreCase = true) }
+                ?: state.artifacts.firstOrNull()
+
+            // If artifacts is empty, try re-querying once
+            if (artifactToDownload == null && state.activeRun != null) {
+                val parts = state.selectedRepoFullName.split("/")
+                if (parts.size == 2) {
+                    try {
+                        val artResp = apiClient.api.getWorkflowArtifacts(parts[0], parts[1], state.activeRun.id)
+                        if (artResp.artifacts.isNotEmpty()) {
+                            _uiState.value = _uiState.value.copy(artifacts = artResp.artifacts)
+                            artifactToDownload = artResp.artifacts.firstOrNull()
+                        }
+                    } catch (_: Exception) { }
+                }
             }
 
-            if (file != null && file.exists() && file.length() > 0L) {
-                _uiState.value = _uiState.value.copy(
-                    isDownloadingApk = false,
-                    downloadedApkFile = file,
-                    downloadErrorMessage = null
-                )
-                notificationHelper.notifySuccess(fileName, file.name)
+            if (artifactToDownload != null) {
+                val file = ArtifactDownloader.downloadAndExtractApk(
+                    getApplication(),
+                    apiClient,
+                    artifactToDownload
+                ) { progress ->
+                    _uiState.value = _uiState.value.copy(downloadProgress = progress)
+                }
+
+                if (file != null && file.exists() && file.length() > 0L) {
+                    _uiState.value = _uiState.value.copy(
+                        isDownloadingApk = false,
+                        downloadedApkFile = file,
+                        downloadErrorMessage = null
+                    )
+                    notificationHelper.notifySuccess(fileName, file.name)
+                    // Auto open install dialog
+                    ArtifactDownloader.installOrOpenApk(context, file)
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        isDownloadingApk = false,
+                        downloadErrorMessage = "Falha ao baixar o arquivo. Abrindo página de download..."
+                    )
+                    openRunInBrowser(context)
+                }
             } else {
                 _uiState.value = _uiState.value.copy(
                     isDownloadingApk = false,
-                    downloadErrorMessage = "Falha ao baixar o APK. Verifique sua conexão com o GitHub."
+                    downloadErrorMessage = "Abrindo página do GitHub Actions para download..."
                 )
+                openRunInBrowser(context)
             }
         }
     }
 
-    fun installDownloadedApk(context: android.content.Context) {
+    fun openRunInBrowser(context: Context) {
+        val state = _uiState.value
+        val url = state.activeRun?.htmlUrl?.ifBlank { null }
+            ?: if (state.selectedRepoFullName.isNotBlank()) "https://github.com/${state.selectedRepoFullName}/actions" else "https://github.com"
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(intent)
+        } catch (_: Exception) { }
+    }
+
+    fun installDownloadedApk(context: Context) {
         val file = _uiState.value.downloadedApkFile ?: return
-        com.example.data.zip.ArtifactDownloader.installOrOpenApk(context, file)
+        ArtifactDownloader.installOrOpenApk(context, file)
     }
 
     fun cancelCompilation() {
@@ -671,18 +818,27 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
         if (parts.size != 2) return
 
         notificationHelper.cancelNotification()
+        isCurrentlyCompiling = false
+        compilationPollingJob?.cancel()
+
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 apiClient.api.cancelWorkflowRun(parts[0], parts[1], run.id)
-                appendLog("Cancelamento solicitado para a execução #${run.runNumber}...")
-            } catch (e: Exception) {
-                appendLog("Não foi possível cancelar: ${extractErrorMessage(e)}")
-            }
+            } catch (_: Exception) { }
         }
+
+        _uiState.value = _uiState.value.copy(
+            buildStatus = BuildStatus.CANCELLED,
+            step3Status = StepStatus.FAILURE,
+            step3Detail = "Compilação cancelada pelo usuário.",
+            step4Status = StepStatus.PENDING,
+            step4Detail = "Processo interrompido."
+        )
     }
 
     fun resetCompilation() {
         compilationPollingJob?.cancel()
+        isCurrentlyCompiling = false
         notificationHelper.cancelNotification()
         _uiState.value = _uiState.value.copy(
             currentScreen = AppScreen.SELECT_ZIP,
@@ -695,7 +851,11 @@ class CompilerViewModel(application: Application) : AndroidViewModel(application
             isDownloadingApk = false,
             downloadProgress = 0f,
             downloadedApkFile = null,
-            downloadErrorMessage = null
+            downloadErrorMessage = null,
+            step1Status = StepStatus.PENDING,
+            step2Status = StepStatus.PENDING,
+            step3Status = StepStatus.PENDING,
+            step4Status = StepStatus.PENDING
         )
     }
 }

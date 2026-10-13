@@ -54,11 +54,11 @@ class CompilationNotificationHelper(private val context: Context) {
         fileName: String,
         stepNumber: Int,
         stepTitle: String,
-        totalSteps: Int = 5,
+        totalSteps: Int = 4,
         isIndeterminate: Boolean = false
     ) {
         val cleanFileName = if (fileName.isNotBlank()) fileName else "Projeto.zip"
-        val contentText = "Etapa $stepNumber de $totalSteps: $stepTitle"
+        val contentText = "ETAPA $stepNumber — $stepTitle"
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
@@ -80,7 +80,7 @@ class CompilationNotificationHelper(private val context: Context) {
 
     fun notifySuccess(fileName: String, artifactName: String = "APK") {
         val cleanFileName = if (fileName.isNotBlank()) fileName else "Projeto.zip"
-        val message = "🎉 Etapa 5 de 5: $artifactName gerado com sucesso! Toque para baixar e instalar."
+        val message = "✓ Compilação concluída com sucesso! Toque para baixar o $artifactName."
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
@@ -99,9 +99,9 @@ class CompilationNotificationHelper(private val context: Context) {
         }
     }
 
-    fun notifyFailure(fileName: String, reason: String = "Erro durante o build") {
+    fun notifyFailure(fileName: String, reason: String = "Erro na compilação") {
         val cleanFileName = if (fileName.isNotBlank()) fileName else "Projeto.zip"
-        val message = "❌ Falha na compilação: $reason. Toque para ver os logs do erro."
+        val message = "✗ Falha na compilação: $reason. Toque para ver os logs do erro."
 
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)

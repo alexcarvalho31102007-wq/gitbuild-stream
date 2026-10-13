@@ -191,7 +191,7 @@ class GitHubApiClient(private val tokenProvider: () -> String) {
     }
 
     /**
-     * Download artifact zip directly following 302 redirects
+     * Download artifact zip directly, following 302 redirects safely without leaking Authorization header to storage hosts
      */
     suspend fun downloadArtifactZip(
         downloadUrl: String,
@@ -199,21 +199,68 @@ class GitHubApiClient(private val tokenProvider: () -> String) {
         onProgress: (Float) -> Unit = {}
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            val request = okhttp3.Request.Builder()
-                .url(downloadUrl)
+            val token = tokenProvider().trim()
+
+            // 1. Initial request to GitHub API (without automatic redirect to capture Location)
+            val noRedirectClient = okHttpClient.newBuilder()
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .build()
 
-            val response = okHttpClient.newCall(request).execute()
-            if (!response.isSuccessful) {
+            val initialRequest = okhttp3.Request.Builder()
+                .url(downloadUrl)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "GitCompile-Android-App")
+                .apply {
+                    if (token.isNotEmpty()) {
+                        header("Authorization", "Bearer $token")
+                    }
+                }
+                .build()
+
+            val initialResponse = noRedirectClient.newCall(initialRequest).execute()
+            val code = initialResponse.code
+            val location = initialResponse.header("Location")
+
+            val targetResponse: okhttp3.Response
+            if (code in 300..399 && !location.isNullOrBlank()) {
+                initialResponse.close()
+
+                // 2. Fetch the actual content from the presigned URL (S3 / Azure Blob) WITHOUT Authorization header
+                val storageClient = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
+                    .followRedirects(true)
+                    .followSslRedirects(true)
+                    .build()
+
+                val storageRequest = okhttp3.Request.Builder()
+                    .url(location)
+                    .header("User-Agent", "GitCompile-Android-App")
+                    .build()
+
+                targetResponse = storageClient.newCall(storageRequest).execute()
+            } else if (initialResponse.isSuccessful) {
+                targetResponse = initialResponse
+            } else {
+                initialResponse.close()
                 return@withContext false
             }
 
-            val body = response.body ?: return@withContext false
-            val contentLength = body.contentLength()
+            if (!targetResponse.isSuccessful) {
+                targetResponse.close()
+                return@withContext false
+            }
 
+            val body = targetResponse.body ?: run {
+                targetResponse.close()
+                return@withContext false
+            }
+
+            val contentLength = body.contentLength()
             body.byteStream().use { input ->
                 outputFile.outputStream().use { output ->
-                    val buffer = ByteArray(16 * 1024)
+                    val buffer = ByteArray(32 * 1024)
                     var bytesRead: Int
                     var totalRead = 0L
 
@@ -227,6 +274,7 @@ class GitHubApiClient(private val tokenProvider: () -> String) {
                     output.flush()
                 }
             }
+            targetResponse.close()
             true
         } catch (e: Exception) {
             e.printStackTrace()
