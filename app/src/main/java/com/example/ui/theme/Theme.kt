@@ -1,76 +1,78 @@
 package com.example.ui.theme
 
-import android.os.Build
+import android.app.Activity
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
 
-private val DarkColorScheme = darkColorScheme(
-    primary = GitHubBlueAccent,
-    onPrimary = Color.Black,
-    primaryContainer = Color(0xFF1F4C82),
-    onPrimaryContainer = Color(0xFFDDF4FF),
-    secondary = GitHubGreenAccent,
-    onSecondary = Color.Black,
-    secondaryContainer = Color(0xFF1B4728),
-    onSecondaryContainer = Color(0xFFAFF5B4),
-    tertiary = GitHubPurple,
-    background = GitHubDarkBg,
-    onBackground = GitHubTextPrimary,
-    surface = GitHubCardBg,
-    onSurface = GitHubTextPrimary,
-    surfaceVariant = GitHubCardElevated,
-    onSurfaceVariant = GitHubTextSecondary,
-    outline = GitHubBorder,
-    error = GitHubRedAccent,
-    onError = Color.Black
-)
-
-private val LightColorScheme = lightColorScheme(
-    primary = GitHubBlue,
+private val ProColorScheme = darkColorScheme(
+    primary = PrimaryDark,
     onPrimary = Color.White,
-    primaryContainer = Color(0xFFDDF4FF),
-    onPrimaryContainer = Color(0xFF0C2D6B),
-    secondary = GitHubGreen,
+    secondary = SuccessColor,
     onSecondary = Color.White,
-    secondaryContainer = Color(0xFFAFF5B4),
-    onSecondaryContainer = Color(0xFF0F3818),
-    tertiary = GitHubPurple,
-    background = GitHubLightBg,
-    onBackground = GitHubLightTextPrimary,
-    surface = GitHubLightCard,
-    onSurface = GitHubLightTextPrimary,
-    surfaceVariant = Color(0xFFEAEFF5),
-    onSurfaceVariant = GitHubLightTextSecondary,
-    outline = GitHubLightBorder,
-    error = GitHubRed,
+    tertiary = ErrorColor,
+    onTertiary = Color.White,
+    background = DarkBackground,
+    onBackground = DarkTextPrimary,
+    surface = DarkSurface,
+    onSurface = DarkTextPrimary,
+    surfaceVariant = DarkSurfaceVariant,
+    onSurfaceVariant = DarkTextSecondary,
+    outline = DarkOutline,
+    outlineVariant = DarkOutlineVariant,
+    error = ErrorColor,
     onError = Color.White
 )
 
+private val LightColorScheme = lightColorScheme(
+    primary = PrimaryLight,
+    onPrimary = Color.White,
+    secondary = SuccessColor,
+    onSecondary = Color.White,
+    tertiary = ErrorColor,
+    onTertiary = Color.White,
+    background = LightBackground,
+    onBackground = LightTextPrimary,
+    surface = LightSurface,
+    onSurface = LightTextPrimary,
+    surfaceVariant = LightSurfaceVariant,
+    onSurfaceVariant = LightTextSecondary,
+    outline = LightOutline,
+    outlineVariant = LightOutlineVariant,
+    error = ErrorColor,
+    onError = Color.White
+)
+
+enum class AppThemeMode {
+    SYSTEM,
+    LIGHT,
+    DARK
+}
+
 @Composable
-fun GitCompilerTheme(
+fun MyApplicationTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = false, // Keep developer brand consistency
-    content: @Composable () -> Unit
+    content: @Composable () -> Unit,
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    val colorScheme = if (darkTheme) ProColorScheme else LightColorScheme
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as Activity).window
+            window.statusBarColor = Color.Transparent.toArgb()
+            window.navigationBarColor = Color.Transparent.toArgb()
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.isAppearanceLightStatusBars = !darkTheme
+            controller.isAppearanceLightNavigationBars = !darkTheme
         }
-        darkTheme -> DarkColorScheme
-        else -> DarkColorScheme // By default modern dark developer aesthetic
     }
 
-    MaterialTheme(
-        colorScheme = colorScheme,
-        typography = Typography,
-        content = content
-    )
+    MaterialTheme(colorScheme = colorScheme, typography = Typography, content = content)
 }
